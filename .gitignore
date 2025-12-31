@@ -1,0 +1,21 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+kingdom_intrigue_mvp
+kingdom_intrigue_mvp.exe
+
+# Logs / runtime
+events.jsonl
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

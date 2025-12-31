@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kingdom Intrigue — Live Debug UI</title>
+  <style>
+    :root{
+      --bg:#0b0f14; --panel:#0f1720; --panel2:#0c131b;
+      --text:#e6edf3; --muted:#93a4b8; --border:rgba(255,255,255,0.08);
+      --accent:#3b82f6;
+    }
+    html,body{height:100%; margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    header{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid var(--border); position:sticky; top:0; background:linear-gradient(180deg, rgba(11,15,20,.95), rgba(11,15,20,.85)); backdrop-filter: blur(6px);}
+    .title{font-weight:700; letter-spacing:.2px}
+    .pill{display:inline-flex; gap:8px; align-items:center; padding:6px 10px; border:1px solid var(--border); border-radius:999px; background:rgba(255,255,255,0.03); color:var(--muted)}
+    .pill b{color:var(--text); font-weight:700}
+    .controls{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    select{background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; outline:none}
+    main{padding:14px 16px; display:grid; grid-template-columns: 1.2fr .8fr; gap:12px}
+    .card{background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--border); border-radius:14px; padding:12px; box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    h2{margin:0 0 10px 0; font-size:14px; color:var(--muted); font-weight:600}
+    canvas{width:100%; height:260px; border-radius:12px; border:1px solid var(--border); background:#060a0f}
+    .small{font-size:12px; color:var(--muted)}
+    table{width:100%; border-collapse:collapse; font-size:13px}
+    th,td{padding:8px 10px; border-bottom:1px solid rgba(255,255,255,0.06); text-align:left}
+    th{color:var(--muted); font-weight:600}
+    tr:hover{background:rgba(255,255,255,0.03)}
+    .split{display:grid; grid-template-columns: 1fr; gap:12px}
+    .row{display:flex; gap:10px; flex-wrap:wrap}
+    .tag{display:inline-flex; gap:6px; align-items:center; padding:4px 8px; border:1px solid var(--border); border-radius:999px; background:rgba(255,255,255,0.03); color:var(--muted); font-size:12px}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+    .btn{cursor:pointer}
+    .right pre{margin:0; white-space:pre-wrap; word-break:break-word; font-size:12px; color:var(--muted)}
+    a{color:var(--accent); text-decoration:none}
+  </style>
+</head>
+<body>
+<header>
+  <div class="title">Kingdom Intrigue — Live Debug UI</div>
+  <div class="controls">
+    <span class="pill">tick: <b id="tick">0</b></span>
+    <span class="pill">players: <b id="players">0</b></span>
+    <span class="pill">battles: <b id="battles">0</b></span>
+
+    <span class="tag">Z
+      <select id="z">
+        <option value="0" selected>surface (0)</option>
+        <option value="-1">pocket (-1)</option>
+      </select>
+    </span>
+    <span class="tag">Mode
+      <select id="mode">
+        <option value="players" selected>players</option>
+        <option value="known">knowledge</option>
+        <option value="exp">experienced</option>
+      </select>
+    </span>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Active locations (click to inspect)</h2>
+    <canvas id="heat" width="1200" height="360"></canvas>
+    <div class="small mono" id="heatHint" style="margin-top:8px;"></div>
+
+    <div style="margin-top:12px;">
+      <div class="small">Top active locations (players/battles). Clicking loads <span class="mono">/api/loc</span>.</div>
+      <table id="topTbl" style="margin-top:8px;">
+        <thead>
+          <tr>
+            <th>loc</th><th>players</th><th>battles</th><th>E</th><th>H</th><th>known</th><th>exp</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="split right">
+    <div class="card">
+      <h2>Focused location</h2>
+      <div class="row" id="locTags"></div>
+      <pre id="locJson" class="mono"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Focused player</h2>
+      <div class="row" id="plTags"></div>
+      <pre id="plJson" class="mono"></pre>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+let lastWorld = null;
+let focusedLoc = null;
+
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+function cellValue(it){
+  const mode = $("mode").value;
+  if (mode === "known") return it.knownBy || 0;
+  if (mode === "exp") return it.experiencedBy || 0;
+  return it.players || 0;
+}
+
+function drawHeatmap(world){
+  const c = $("heat");
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0,0,c.width,c.height);
+
+  if (!world || !world.cells) return;
+
+  const cells = world.cells;
+  if (cells.length === 0){
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText("no active locations", 12, 24);
+    return;
+  }
+
+  const minX = world.minLX, maxX = world.maxLX;
+  const minY = world.minLY, maxY = world.maxLY;
+
+  const cols = (maxX - minX + 1);
+  const rows = (maxY - minY + 1);
+
+  const pad = 8;
+  const W = c.width - pad*2;
+  const H = c.height - pad*2;
+  const cellW = W / Math.max(1, cols);
+  const cellH = H / Math.max(1, rows);
+
+  let maxV = 1;
+  for (const it of cells) maxV = Math.max(maxV, cellValue(it));
+
+  // background grid
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.lineWidth = 1;
+  for (let i=0;i<=cols;i++){
+    const x = pad + i*cellW;
+    ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, pad+H); ctx.stroke();
+  }
+  for (let j=0;j<=rows;j++){
+    const y = pad + j*cellH;
+    ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(pad+W, y); ctx.stroke();
+  }
+
+  // draw cells
+  for (const it of cells){
+    const gx = it.lx - minX;
+    const gy = it.ly - minY;
+    const x = pad + gx*cellW;
+    const y = pad + gy*cellH;
+
+    const a = clamp01(cellValue(it)/maxV);
+    // subtle blue intensity
+    ctx.fillStyle = `rgba(59,130,246,${0.10 + a*0.70})`;
+    ctx.fillRect(x+1, y+1, cellW-2, cellH-2);
+
+    // entrances markers
+    if ((it.entrances||0) > 0) {
+      const r  = Math.max(2, Math.floor(Math.min(cellW, cellH) * 0.12));
+      const baseX = x + (cellW * 0.70);
+      const cy1 = y + (cellH * 0.30);
+      const cy2 = y + (cellH * 0.70);
+
+      // caves: filled blue
+      for (let i=0; i<(it.caves||0); i++){
+        const ox = i * (r*2 + 2);
+        if ((it.hidden||0) > 0) {
+          ctx.strokeStyle = "rgba(59,130,246,0.95)";
+          ctx.beginPath(); ctx.arc(baseX+ox, cy1, r, 0, Math.PI*2); ctx.stroke();
+        } else {
+          ctx.fillStyle = "rgba(59,130,246,0.95)";
+          ctx.beginPath(); ctx.arc(baseX+ox, cy1, r, 0, Math.PI*2); ctx.fill();
+        }
+      }
+      // sinkholes: filled red
+      for (let i=0; i<(it.sinkholes||0); i++){
+        const ox = i * (r*2 + 2);
+        if ((it.hidden||0) > 0) {
+          ctx.strokeStyle = "rgba(239,68,68,0.95)";
+          ctx.beginPath(); ctx.arc(baseX+ox, cy2, r, 0, Math.PI*2); ctx.stroke();
+        } else {
+          ctx.fillStyle = "rgba(239,68,68,0.95)";
+          ctx.beginPath(); ctx.arc(baseX+ox, cy2, r, 0, Math.PI*2); ctx.fill();
+        }
+      }
+    }
+
+    // highlight focused
+    if (focusedLoc && focusedLoc.x === it.lx && focusedLoc.y === it.ly && focusedLoc.z === it.lz){
+      ctx.strokeStyle = "rgba(255,255,255,0.55)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x+2, y+2, cellW-4, cellH-4);
+      ctx.lineWidth = 1;
+    }
+  }
+
+  $("heatHint").textContent =
+    `heatmap z=${world.z} mode=${$("mode").value} bbox lx[${minX}..${maxX}] ly[${minY}..${maxY}] active=${cells.length} max=${maxV}. Click cell to inspect.`;
+}
+
+function renderTop(world){
+  const tb = $("topTbl").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const it of (world.top||[])){
+    const tr = document.createElement("tr");
+    tr.className = "btn";
+    tr.innerHTML = `<td class="mono">${it.lx},${it.ly},${it.lz}</td>
+      <td>${it.players}</td><td>${it.battles}</td><td>${it.entrances||0}</td><td>${it.hidden||0}</td>
+      <td>${it.knownBy||0}</td><td>${it.experiencedBy||0}</td>`;
+    tr.addEventListener("click", ()=> loadLoc(it.lx,it.ly,it.lz));
+    tb.appendChild(tr);
+  }
+}
+
+async function loadWorld(){
+  const z = $("z").value;
+  const res = await fetch(`/api/world?z=${encodeURIComponent(z)}`);
+  const world = await res.json();
+  lastWorld = world;
+  $("tick").textContent = world.tick;
+  $("players").textContent = world.playersLive;
+  $("battles").textContent = world.battles;
+  drawHeatmap(world);
+  renderTop(world);
+}
+
+async function loadLoc(x,y,z){
+  focusedLoc = {x,y,z};
+  const res = await fetch(`/api/loc?x=${x}&y=${y}&z=${z}`);
+  const loc = await res.json();
+
+  const tags = [];
+  tags.push(`<span class="tag mono">loc ${x},${y},${z}</span>`);
+  tags.push(`<span class="tag">kind ${loc.kind}</span>`);
+  tags.push(`<span class="tag">players ${loc.players.length}</span>`);
+  tags.push(`<span class="tag">entrances ${(loc.entrances||[]).length}</span>`);
+  $("locTags").innerHTML = tags.join("");
+
+  $("locJson").textContent = JSON.stringify(loc, null, 2);
+
+  // focus first alive player (if any)
+  const alive = (loc.players||[]).find(p=>p.alive);
+  if (alive) renderPlayer(alive);
+}
+
+function renderPlayer(p){
+  const tags = [];
+  tags.push(`<span class="tag mono">id ${p.id}</span>`);
+  tags.push(`<span class="tag">alive ${p.alive}</span>`);
+  tags.push(`<span class="tag">hp ${p.hp}</span>`);
+  tags.push(`<span class="tag mono">xy ${p.x},${p.y}</span>`);
+  tags.push(`<span class="tag">battle ${p.inBattle}</span>`);
+  $("plTags").innerHTML = tags.join("");
+  $("plJson").textContent = JSON.stringify(p, null, 2);
+}
+
+$("heat").addEventListener("click", (ev)=>{
+  if (!lastWorld) return;
+  const rect = $("heat").getBoundingClientRect();
+  const x = (ev.clientX - rect.left) / rect.width * $("heat").width;
+  const y = (ev.clientY - rect.top) / rect.height * $("heat").height;
+
+  const pad = 8;
+  const minX = lastWorld.minLX, maxX = lastWorld.maxLX;
+  const minY = lastWorld.minLY, maxY = lastWorld.maxLY;
+  const cols = (maxX - minX + 1);
+  const rows = (maxY - minY + 1);
+  const W = $("heat").width - pad*2;
+  const H = $("heat").height - pad*2;
+  const cellW = W / Math.max(1, cols);
+  const cellH = H / Math.max(1, rows);
+
+  const gx = Math.floor((x - pad)/cellW);
+  const gy = Math.floor((y - pad)/cellH);
+  if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) return;
+  const lx = minX + gx;
+  const ly = minY + gy;
+  const lz = lastWorld.z;
+
+  loadLoc(lx, ly, lz);
+});
+
+$("z").addEventListener("change", loadWorld);
+$("mode").addEventListener("change", ()=> drawHeatmap(lastWorld));
+
+setInterval(loadWorld, 600);
+loadWorld();
+</script>
+</body>
+</html>
