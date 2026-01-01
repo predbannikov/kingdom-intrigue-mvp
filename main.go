@@ -44,10 +44,16 @@ const (
 	ManualPinChanceRumor  = 2
 	SpawnInvuln           = 5 * time.Second
 
-	ParleyChanceOnMeet = 18
-	MapBuyRumorPrice   = 2
-	MapBuySeenPrice    = 4
-	MapBuyExpPrice     = 7
+	ParleyChanceOnMeet 	= 18
+	MapBuyRumorPrice   	= 2
+	MapBuySeenPrice    	= 4
+	MapBuyExpPrice     	= 7
+	
+	POILootCooldown 	= 20 * time.Second
+	
+	SeenPOITTLSec      = 6 * time.Second    // сколько “держится в голове” факт, что видел
+	SeenToKnownCount   = 3                  // сколько раз увидеть, чтобы стало KnowSeen
+	SeenToKnownWindow  = 20 * time.Second   // окно накопления
 )
 
 type Phase string
@@ -158,8 +164,11 @@ type Player struct {
 	Gold         int
 	LastPin      time.Time
 
-	KnownLocations map[LocKey]LocKnowLevel
-	KnownPOI       map[string]POIKnow
+	KnownLocations  map[LocKey]LocKnowLevel
+	KnownPOI        map[string]POIKnow
+	LastPOILoot     map[string]time.Time
+	SeenPOI 	    map[string]time.Time
+	SeenPOICount 	map[string]int
 }
 
 type Gate struct {
@@ -226,7 +235,7 @@ func main() {
 	w := NewWorld()
 	seedWorld(w, *players)
 
-	srv := NewServer(w)
+	srv := NewServer(w, *players)
 
 	// Hook events to in-memory ring buffer too.
 	w.OnEvent = srv.appendEvent
@@ -242,6 +251,11 @@ func main() {
 	mux.HandleFunc("/api/loc", srv.handleLoc)
 	mux.HandleFunc("/api/events", srv.handleEvents)
 	mux.HandleFunc("/api/stream", srv.handleStream)
+	
+	mux.HandleFunc("/api/dev/pause", srv.handleDevPause)
+	mux.HandleFunc("/api/dev/step", srv.handleDevStep)
+	mux.HandleFunc("/api/dev/seed", srv.handleDevSeed)
+	mux.HandleFunc("/api/dev/reset", srv.handleDevReset)
 
 	// Static UI
 	fs := http.FileServer(http.Dir("./web"))
@@ -270,7 +284,10 @@ func seedWorld(w *World, playerCount int) {
 			Gold:           2 + w.Rng.Intn(10),
 			KnownLocations: map[LocKey]LocKnowLevel{},
 			KnownPOI:       map[string]POIKnow{},
+			LastPOILoot: map[string]time.Time{},
 			SpawnProtect:   now.Add(SpawnInvuln),
+			SeenPOI:      map[string]time.Time{},
+			SeenPOICount: map[string]int{},
 		}
 		loc.Players[p.ID] = p
 		p.KnownLocations[loc.Key] = LocKnowExperienced
@@ -306,6 +323,23 @@ func (w *World) FindPlayer(id int) *Player {
 
 // ------------------- SERVER -------------------
 
+type ctrlMsgKind string
+
+const (
+	ctrlPause ctrlMsgKind = "pause"
+	ctrlStep  ctrlMsgKind = "step"
+	ctrlSeed  ctrlMsgKind = "seed"
+	ctrlReset ctrlMsgKind = "reset"
+)
+
+type ctrlMsg struct {
+	kind   ctrlMsgKind
+	paused bool
+	n      int
+	seed   int64
+	players int
+}
+
 type Server struct {
 	worldMu sync.RWMutex
 	evMu    sync.RWMutex
@@ -314,16 +348,24 @@ type Server struct {
 	tick  int
 
 	events []Event
-	// very small set of stream listeners (SSE)
-	subs map[chan []byte]struct{}
+	subs   map[chan []byte]struct{}
+
+	// dev controls
+	ctrlCh      chan ctrlMsg
+	paused      bool
+	stepRemain  int
+	playerCount int
 }
 
 
-func NewServer(w *World) *Server {
+
+func NewServer(w *World, playerCount int) *Server {
 	return &Server{
-		world:  w,
-		events: make([]Event, 0, 4096),
-		subs:   map[chan []byte]struct{}{},
+		world:       w,
+		playerCount: playerCount,
+		events:      make([]Event, 0, 4096),
+		subs:        map[chan []byte]struct{}{},
+		ctrlCh:      make(chan ctrlMsg, 64),
 	}
 }
 
@@ -351,35 +393,117 @@ func (s *Server) broadcast(payload any, eventName string) {
 	}
 }
 
+func (s *Server) doTick(dt time.Duration) *WorldSnapshot {
+	var snap *WorldSnapshot
+
+	s.worldMu.Lock()
+	s.tick++
+	s.world.TickAllLocations()
+
+	// forget sweep
+	s.world.ForgetSweepIfNeeded()
+
+	if s.tick%3 == 0 {
+	  ws := BuildWorldSnapshot(s.world, s.tick, 0)
+	  ws.Paused = s.paused
+	  snap = &ws
+	}
+	s.worldMu.Unlock()
+
+	return snap
+}
+
 func (s *Server) RunTicker(dt time.Duration) {
 	t := time.NewTicker(dt)
 	defer t.Stop()
 
-	lastForget := time.Now()
-
-	for range t.C {
-		var snap *WorldSnapshot
-
-		s.worldMu.Lock()
-		s.tick++
-		s.world.TickAllLocations()
-
-		if time.Since(lastForget) >= ForgetSweepEvery {
-			s.world.ForgetSweepIfNeeded()
-			lastForget = time.Now()
+	for {
+		// если пауза и нет шагов — ждём команду
+		if s.paused && s.stepRemain <= 0 {
+			msg := <-s.ctrlCh
+			s.applyCtrl(msg)
+			continue
 		}
 
-		if s.tick%3 == 0 {
-			s := BuildWorldSnapshot(s.world, s.tick, 0)
-			snap = &s
-		}
-		s.worldMu.Unlock()
+		select {
+		case msg := <-s.ctrlCh:
+			s.applyCtrl(msg)
 
-		if snap != nil {
-			s.broadcast(snap, "world")
+		case <-t.C:
+			// если на паузе — тики по таймеру не исполняем
+			if s.paused {
+				continue
+			}
+			if snap := s.doTick(dt); snap != nil {
+				s.broadcast(snap, "world")
+			}
+
+		default:
+			// step-mode: выполняем шаги сразу, без ожидания таймера
+			if s.paused && s.stepRemain > 0 {
+				s.stepRemain--
+				if snap := s.doTick(dt); snap != nil {
+					s.broadcast(snap, "world")
+				}
+				continue
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 }
+
+func (s *Server) applyCtrl(msg ctrlMsg) {
+	switch msg.kind {
+	case ctrlPause:
+		s.paused = msg.paused
+
+	case ctrlStep:
+		if msg.n <= 0 {
+			msg.n = 1
+		}
+		s.paused = true
+		s.stepRemain += msg.n
+
+	case ctrlSeed:
+		s.worldMu.Lock()
+		s.world.Rng = rand.New(rand.NewSource(msg.seed))
+		s.world.Log(Event{
+			T: time.Now(), K: "DEV_SEED",
+			Msg: "rng reseeded",
+			Ex: map[string]any{"seed": msg.seed},
+		})
+		s.worldMu.Unlock()
+
+	case ctrlReset:
+		pc := msg.players
+		if pc <= 0 {
+			pc = s.playerCount
+		} else {
+			s.playerCount = pc
+		}
+
+		// пересоздаём мир под локом
+		s.worldMu.Lock()
+		if s.world != nil && s.world.LogFile != nil {
+			_ = s.world.LogFile.Close()
+		}
+		nw := NewWorld()
+		seedWorld(nw, pc)
+		// вернуть хук событий
+		nw.OnEvent = s.appendEvent
+
+		s.world = nw
+		s.tick = 0
+		s.stepRemain = 0
+		s.worldMu.Unlock()
+
+		// почистим in-mem events, чтобы не мешало
+		s.evMu.Lock()
+		s.events = s.events[:0]
+		s.evMu.Unlock()
+	}
+}
+
 
 
 func (s *Server) handleWorld(w http.ResponseWriter, r *http.Request) {
@@ -393,7 +517,10 @@ func (s *Server) handleWorld(w http.ResponseWriter, r *http.Request) {
 
 	s.worldMu.RLock()
 	defer s.worldMu.RUnlock()
-	writeJSON(w, BuildWorldSnapshot(s.world, s.tick, z))
+
+	snap := BuildWorldSnapshot(s.world, s.tick, z)
+	snap.Paused = s.paused
+	writeJSON(w, snap)
 }
 
 
@@ -501,6 +628,8 @@ type WorldSnapshot struct {
 
 	Cells []LocSummary `json:"cells"`
 	Top   []LocSummary `json:"top"`
+	
+	Paused bool `json:"paused"`
 }
 
 type LocSummary struct {
@@ -991,7 +1120,7 @@ func (w *World) TrySeeEntrances(loc *Location, p *Player, now time.Time) {
 		if e.Kind == EntranceCave {
 			if abs(e.X-p.X) <= 1 && abs(e.Y-p.Y) <= 1 {
 				key := poiKey(loc.Key, e.X, e.Y, "CAVE")
-				w.AddPOIKnowledge(p, key, KnowSeen, now, "saw cave entrance", map[string]any{
+				w.MarkPOISeen(p, key, now, map[string]any{
 					"x": e.X, "y": e.Y, "entranceId": e.ID,
 				})
 			}
@@ -1013,6 +1142,7 @@ func (w *World) HandleEntranceTrigger(loc *Location, p *Player, e *Entrance, now
 	w.AddPOIKnowledge(p, key, KnowExperienced, now, "experienced entrance", map[string]any{
 		"x": e.X, "y": e.Y, "entranceId": e.ID, "kind": e.Kind, "hidden": e.Hidden,
 	})
+	w.TryGrantPOILoot(p, key, e, now)
 	if e.PocketID == 0 {
 		e.PocketID = w.NextPocketID
 		w.NextPocketID++
@@ -1208,6 +1338,15 @@ func (w *World) ForgetSweepIfNeeded() {
 					w.Log(Event{T: now, K: "FORGET_POI", LX: p.Loc.X, LY: p.Loc.Y, LZ: p.Loc.Z, P1: p.ID, Msg: "forgot POI", Ex: map[string]any{
 						"key": key, "level": know.Level.String(), "ageSec": int(age.Seconds()),
 					}})
+				}
+			}
+			// sweep perception (SeenPOI)
+			for key, t := range p.SeenPOI {
+				age := now.Sub(t)
+				if age >= SeenPOITTLSec {
+					delete(p.SeenPOI, key)
+					// и заодно сбросим счётчик, если хотим окно накопления:
+					delete(p.SeenPOICount, key)
 				}
 			}
 		}
@@ -1518,4 +1657,168 @@ func mergeMap(a, b map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+
+func (s *Server) handleDevPause(w http.ResponseWriter, r *http.Request) {
+	// POST/GET: ?state=1|0  (если нет — toggle)
+	q := r.URL.Query().Get("state")
+	var paused bool
+	if q == "" {
+		paused = !s.paused
+	} else {
+		paused = (q == "1" || q == "true" || q == "on")
+	}
+	s.ctrlCh <- ctrlMsg{kind: ctrlPause, paused: paused}
+	writeJSON(w, map[string]any{"ok": true, "paused": paused})
+}
+
+func (s *Server) handleDevStep(w http.ResponseWriter, r *http.Request) {
+	n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+	if n <= 0 {
+		n = 1
+	}
+	s.ctrlCh <- ctrlMsg{kind: ctrlStep, n: n}
+	writeJSON(w, map[string]any{"ok": true, "step": n})
+}
+
+func (s *Server) handleDevSeed(w http.ResponseWriter, r *http.Request) {
+	v := r.URL.Query().Get("value")
+	if v == "" {
+		http.Error(w, "missing value", 400)
+		return
+	}
+	seed, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		http.Error(w, "bad value", 400)
+		return
+	}
+	s.ctrlCh <- ctrlMsg{kind: ctrlSeed, seed: seed}
+	writeJSON(w, map[string]any{"ok": true, "seed": seed})
+}
+
+func (s *Server) handleDevReset(w http.ResponseWriter, r *http.Request) {
+	pc, _ := strconv.Atoi(r.URL.Query().Get("players"))
+	s.ctrlCh <- ctrlMsg{kind: ctrlReset, players: pc}
+	writeJSON(w, map[string]any{"ok": true, "players": pc})
+}
+
+func (w *World) TryGrantPOILoot(p *Player, poi string, e *Entrance, now time.Time) {
+	if p.LastPOILoot == nil {
+		p.LastPOILoot = map[string]time.Time{}
+	}
+	if t, ok := p.LastPOILoot[poi]; ok {
+		if now.Sub(t) < POILootCooldown {
+			return
+		}
+	}
+
+	p.LastPOILoot[poi] = now
+
+	// базовые значения
+	gold := 0
+	ink := 0
+	hpDelta := 0
+
+	switch e.Kind {
+	case EntranceCave:
+		// почти всегда немного золота
+		gold = 1 + w.Rng.Intn(3) // 1..3
+		if w.Rng.Intn(100) < 18 {
+			ink = 1
+		}
+
+	case EntranceSinkhole:
+		// риск
+		if w.Rng.Intn(100) < 55 {
+			hpDelta = -(1 + w.Rng.Intn(5)) // -1..-5
+		}
+		// шанс “джекпота”
+		if w.Rng.Intn(100) < 35 {
+			gold = 3 + w.Rng.Intn(8) // 3..10
+		} else {
+			gold = w.Rng.Intn(2) // 0..1
+		}
+		if w.Rng.Intn(100) < 30 {
+			ink = 1
+		}
+	}
+
+	if gold == 0 && ink == 0 && hpDelta == 0 {
+		return
+	}
+
+	p.Gold += gold
+	p.Ink += ink
+	if hpDelta != 0 {
+		p.HP += hpDelta
+		if p.HP <= 0 {
+			// смерть от ловушки: аккуратно, чтобы не ломать бой/логику
+			p.Alive = false
+			p.InBattle = 0
+			p.DeadUntil = now.Add(5 * time.Second)
+			w.Log(Event{T: now, K: "DEATH", LX: p.Loc.X, LY: p.Loc.Y, LZ: p.Loc.Z, P1: p.ID, Msg: "died from sinkhole", Ex: map[string]any{"respawnInSec": 5}})
+		}
+	}
+
+	w.Log(Event{
+		T: now, K: "POI_LOOT",
+		LX: p.Loc.X, LY: p.Loc.Y, LZ: p.Loc.Z,
+		P1: p.ID,
+		Msg: "poi loot granted",
+		Ex: map[string]any{
+			"poi": poi,
+			"kind": string(e.Kind),
+			"gold": gold,
+			"ink": ink,
+			"hpDelta": hpDelta,
+			"hp": p.HP,
+			"cooldownSec": int(POILootCooldown.Seconds()),
+		},
+	})
+}
+
+func (w *World) MarkPOISeen(p *Player, key string, now time.Time, extra map[string]any) {
+	if p.SeenPOI == nil {
+		p.SeenPOI = map[string]time.Time{}
+	}
+	if p.SeenPOICount == nil {
+		p.SeenPOICount = map[string]int{}
+	}
+
+	// обновляем "видел недавно"
+	p.SeenPOI[key] = now
+
+	// накапливаем счётчик, но только если не слишком давно последний раз видел
+	// (простая логика: если запись была очень старой — считаем как заново)
+	//last, ok := p.SeenPOI[key]
+	//_ = ok
+	// last == now тут, поэтому для окна используем отдельное: будем сбрасывать в sweep (см. ниже)
+
+	p.SeenPOICount[key]++
+
+	w.Log(Event{
+		T: now, K: "POI_SEEN",
+		LX: p.Loc.X, LY: p.Loc.Y, LZ: p.Loc.Z,
+		P1: p.ID,
+		Msg: "poi seen",
+		Ex: mergeMap(extra, map[string]any{
+			"key":   key,
+			"count": p.SeenPOICount[key],
+		}),
+	})
+
+	// если уже знает — ничего не делаем
+	if p.KnownPOI != nil {
+		if kn, ok := p.KnownPOI[key]; ok && kn.Level >= KnowSeen {
+			return
+		}
+	}
+
+	// перевод "видел много раз" -> KnowSeen
+	if p.SeenPOICount[key] >= SeenToKnownCount {
+		w.AddPOIKnowledge(p, key, KnowSeen, now, "learned poi by repeated sightings", map[string]any{
+			"seenCount": p.SeenPOICount[key],
+		})
+	}
 }
