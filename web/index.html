@@ -33,6 +33,10 @@
     .btn{cursor:pointer}
     .right pre{margin:0; white-space:pre-wrap; word-break:break-word; font-size:12px; color:var(--muted)}
     a{color:var(--accent); text-decoration:none}
+	.btn.on{
+  border:1px solid rgba(59,130,246,0.7);
+  box-shadow:0 0 0 2px rgba(59,130,246,0.15) inset;
+}
   </style>
 </head>
 <body>
@@ -42,6 +46,13 @@
     <span class="pill">tick: <b id="tick">0</b></span>
     <span class="pill">players: <b id="players">0</b></span>
     <span class="pill">battles: <b id="battles">0</b></span>
+	<span class="pill">paused: <b id="paused">false</b></span>
+
+	<span class="tag">DEV
+		<button class="btn" id="btnPause">pause</button>
+		<button class="btn" id="btnStep">step</button>
+		<button class="btn" id="btnReset">reset</button>
+	</span>
 
     <span class="tag">Z
       <select id="z">
@@ -107,6 +118,23 @@ function cellValue(it){
   if (mode === "exp") return it.experiencedBy || 0;
   return it.players || 0;
 }
+
+async function devPost(url){
+  try{
+    await fetch(url, { method: "POST" });
+  }catch(e){
+    console.warn("devPost failed", url, e);
+  }
+}
+
+const bp = $("btnPause");
+if (bp) bp.addEventListener("click", ()=> devPost("/api/dev/pause"));
+
+const bs = $("btnStep");
+if (bs) bs.addEventListener("click", ()=> devPost("/api/dev/step?n=1"));
+
+const br = $("btnReset");
+if (br) br.addEventListener("click", ()=> devPost("/api/dev/reset"));
 
 function drawHeatmap(world){
   const c = $("heat");
@@ -227,6 +255,9 @@ async function loadWorld(){
   $("tick").textContent = world.tick;
   $("players").textContent = world.playersLive;
   $("battles").textContent = world.battles;
+  $("paused").textContent = !!world.paused;
+  $("btnPause")?.classList.toggle("on", !!world.paused);
+  $("btnPause").textContent = world.paused ? "resume" : "pause";
   drawHeatmap(world);
   renderTop(world);
 }
