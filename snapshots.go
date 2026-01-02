@@ -4,7 +4,8 @@ import (
 	"sort"
 )
 
-
+// WorldSnapshot — публичный контракт для UI (/api/world).
+// Менять поля/имена нельзя без версии или отдельного endpoint.
 type WorldSnapshot struct {
 	Tick        int `json:"tick"`
 	Z           int `json:"z"`

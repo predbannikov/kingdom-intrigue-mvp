@@ -32,11 +32,13 @@ func main() {
 	mux.HandleFunc("/api/loc", srv.handleLoc)
 	mux.HandleFunc("/api/events", srv.handleEvents)
 	mux.HandleFunc("/api/stream", srv.handleStream)
-	
+
 	mux.HandleFunc("/api/dev/pause", srv.handleDevPause)
 	mux.HandleFunc("/api/dev/step", srv.handleDevStep)
 	mux.HandleFunc("/api/dev/seed", srv.handleDevSeed)
 	mux.HandleFunc("/api/dev/reset", srv.handleDevReset)
+
+	mux.HandleFunc("/api/debug/world", srv.handleDebugWorld)
 
 	// Static UI
 	fs := http.FileServer(http.Dir("./web"))
@@ -47,4 +49,3 @@ func main() {
 	fmt.Printf("API: http://localhost:%d/api/world\n", *port)
 	_ = http.ListenAndServe(addr, mux)
 }
-

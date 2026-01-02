@@ -33,10 +33,8 @@
     .btn{cursor:pointer}
     .right pre{margin:0; white-space:pre-wrap; word-break:break-word; font-size:12px; color:var(--muted)}
     a{color:var(--accent); text-decoration:none}
-	.btn.on{
-  border:1px solid rgba(59,130,246,0.7);
-  box-shadow:0 0 0 2px rgba(59,130,246,0.15) inset;
-}
+    .btn.on{border:1px solid rgba(59,130,246,0.7); box-shadow:0 0 0 2px rgba(59,130,246,0.15) inset;}
+    
   </style>
 </head>
 <body>
@@ -48,25 +46,33 @@
     <span class="pill">battles: <b id="battles">0</b></span>
 	<span class="pill">paused: <b id="paused">false</b></span>
 
-	<span class="tag">DEV
-		<button class="btn" id="btnPause">pause</button>
-		<button class="btn" id="btnStep">step</button>
-		<button class="btn" id="btnReset">reset</button>
-	</span>
+  <span class="tag">DEV
+    <button class="btn" id="btnPause">pause</button>
 
-    <span class="tag">Z
-      <select id="z">
-        <option value="0" selected>surface (0)</option>
-        <option value="-1">pocket (-1)</option>
-      </select>
-    </span>
-    <span class="tag">Mode
-      <select id="mode">
-        <option value="players" selected>players</option>
-        <option value="known">knowledge</option>
-        <option value="exp">experienced</option>
-      </select>
-    </span>
+    <button class="btn" id="btnStep1">step 1</button>
+    <button class="btn" id="btnStep10">step 10</button>
+    <button class="btn" id="btnStep100">step 100</button>
+
+    <button class="btn" id="btnReset">reset</button>
+    <input id="playersVal" class="mono" style="width:70px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--panel); color:var(--text);" placeholder="players"/>
+
+    <input id="seedVal" class="mono" style="width:120px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--panel); color:var(--text);" placeholder="seed"/>
+    <button class="btn" id="btnSeed">seed</button>
+  </span>
+
+  <span class="tag">Z
+    <select id="z">
+      <option value="0" selected>surface (0)</option>
+      <option value="-1">pocket (-1)</option>
+    </select>
+  </span>
+  <span class="tag">Mode
+    <select id="mode">
+      <option value="players" selected>players</option>
+      <option value="known">knowledge</option>
+      <option value="exp">experienced</option>
+    </select>
+  </span>
   </div>
 </header>
 
@@ -127,14 +133,23 @@ async function devPost(url){
   }
 }
 
-const bp = $("btnPause");
-if (bp) bp.addEventListener("click", ()=> devPost("/api/dev/pause"));
+$("btnPause")?.addEventListener("click", ()=> devPost("/api/dev/pause"));
 
-const bs = $("btnStep");
-if (bs) bs.addEventListener("click", ()=> devPost("/api/dev/step?n=1"));
+$("btnStep1")?.addEventListener("click", ()=> devPost("/api/dev/step?n=1"));
+$("btnStep10")?.addEventListener("click", ()=> devPost("/api/dev/step?n=10"));
+$("btnStep100")?.addEventListener("click", ()=> devPost("/api/dev/step?n=100"));
 
-const br = $("btnReset");
-if (br) br.addEventListener("click", ()=> devPost("/api/dev/reset"));
+$("btnReset")?.addEventListener("click", ()=>{
+  const pv = $("playersVal")?.value?.trim();
+  const q = pv ? `?players=${encodeURIComponent(pv)}` : "";
+  devPost(`/api/dev/reset${q}`);
+});
+
+$("btnSeed")?.addEventListener("click", ()=>{
+  const v = $("seedVal")?.value?.trim();
+  if (!v) return;
+  devPost(`/api/dev/seed?value=${encodeURIComponent(v)}`);
+});
 
 function drawHeatmap(world){
   const c = $("heat");
@@ -257,7 +272,7 @@ async function loadWorld(){
   $("battles").textContent = world.battles;
   $("paused").textContent = !!world.paused;
   $("btnPause")?.classList.toggle("on", !!world.paused);
-  $("btnPause").textContent = world.paused ? "resume" : "pause";
+  if ($("btnPause")) $("btnPause").textContent = world.paused ? "resume" : "pause";
   drawHeatmap(world);
   renderTop(world);
 }

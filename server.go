@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 )
-
 
 type ctrlMsgKind string
 
@@ -21,10 +21,10 @@ const (
 )
 
 type ctrlMsg struct {
-	kind   ctrlMsgKind
-	paused bool
-	n      int
-	seed   int64
+	kind    ctrlMsgKind
+	paused  bool
+	n       int
+	seed    int64
 	players int
 }
 
@@ -44,8 +44,6 @@ type Server struct {
 	stepRemain  int
 	playerCount int
 }
-
-
 
 func NewServer(w *World, playerCount int) *Server {
 	return &Server{
@@ -92,9 +90,9 @@ func (s *Server) doTick(dt time.Duration) *WorldSnapshot {
 	s.world.ForgetSweepIfNeeded()
 
 	if s.tick%3 == 0 {
-	  ws := BuildWorldSnapshot(s.world, s.tick, 0)
-	  ws.Paused = s.paused
-	  snap = &ws
+		ws := BuildWorldSnapshot(s.world, s.tick, 0)
+		ws.Paused = s.paused
+		snap = &ws
 	}
 	s.worldMu.Unlock()
 
@@ -158,7 +156,7 @@ func (s *Server) applyCtrl(msg ctrlMsg) {
 		s.world.Log(Event{
 			T: time.Now(), K: "DEV_SEED",
 			Msg: "rng reseeded",
-			Ex: map[string]any{"seed": msg.seed},
+			Ex:  map[string]any{"seed": msg.seed},
 		})
 		s.worldMu.Unlock()
 
@@ -192,8 +190,6 @@ func (s *Server) applyCtrl(msg ctrlMsg) {
 	}
 }
 
-
-
 func (s *Server) handleWorld(w http.ResponseWriter, r *http.Request) {
 	z, err := strconv.Atoi(r.URL.Query().Get("z"))
 	if err != nil {
@@ -207,10 +203,13 @@ func (s *Server) handleWorld(w http.ResponseWriter, r *http.Request) {
 	defer s.worldMu.RUnlock()
 
 	snap := BuildWorldSnapshot(s.world, s.tick, z)
+	if snap.MinLX > snap.MaxLX || snap.MinLY > snap.MaxLY {
+		// это не паника, просто сигнал: снапшот странный
+		w.Header().Set("X-Warn", "bad-bbox")
+	}
 	snap.Paused = s.paused
 	writeJSON(w, snap)
 }
-
 
 func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
@@ -301,7 +300,6 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = enc.Encode(v)
 }
 
-
 func (s *Server) handleDevPause(w http.ResponseWriter, r *http.Request) {
 	// POST/GET: ?state=1|0  (если нет — toggle)
 	q := r.URL.Query().Get("state")
@@ -345,3 +343,36 @@ func (s *Server) handleDevReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "players": pc})
 }
 
+func (s *Server) handleDebugWorld(w http.ResponseWriter, r *http.Request) {
+	s.worldMu.RLock()
+	defer s.worldMu.RUnlock()
+
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host != "127.0.0.1" && host != "::1" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Пример: отдать просто активные локации (или всё, что тебе надо)
+	locs := make([]any, 0, len(s.world.Locations))
+	for k, loc := range s.world.Locations {
+		// Можно фильтровать: только если там кто-то есть/бои/входы
+		if len(loc.Players) == 0 && len(loc.Entrances) == 0 {
+			continue
+		}
+		locs = append(locs, map[string]any{
+			"key":       k,
+			"kind":      loc.Kind,
+			"players":   len(loc.Players),
+			"entrances": len(loc.Entrances),
+		})
+	}
+
+	writeJSON(w, map[string]any{
+		"t":         time.Now().UnixMilli(),
+		"tick":      s.tick,
+		"paused":    s.paused,
+		"locations": locs,
+		// можешь добавить любые поля, не боясь UI
+	})
+}
