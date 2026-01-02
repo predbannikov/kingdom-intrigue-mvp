@@ -31,22 +31,23 @@ const (
 	ForgetExperiencedAfter = 90 * time.Second
 	ForgetSweepEvery       = 2 * time.Second
 
-	ManualPinCooldown     = 3 * time.Second
-	ManualPinChanceSeen   = 10
-	ManualPinChanceExp    = 45
-	ManualPinChanceRumor  = 2
-	SpawnInvuln           = 5 * time.Second
+	ManualPinCooldown    = 3 * time.Second
+	ManualPinChanceSeen  = 10
+	ManualPinChanceExp   = 45
+	ManualPinChanceRumor = 2
+	SpawnInvuln          = 5 * time.Second
 
-	ParleyChanceOnMeet 	= 18
-	MapBuyRumorPrice   	= 2
-	MapBuySeenPrice    	= 4
-	MapBuyExpPrice     	= 7
-	
-	POILootCooldown 	= 20 * time.Second
-	
-	SeenPOITTLSec      = 6 * time.Second    // сколько “держится в голове” факт, что видел
-	SeenToKnownCount   = 3                  // сколько раз увидеть, чтобы стало KnowSeen
-	SeenToKnownWindow  = 20 * time.Second   // окно накопления
+	ParleyChanceOnMeet = 18
+	MapBuyRumorPrice   = 2
+	MapBuySeenPrice    = 4
+	MapBuyExpPrice     = 7
+
+	POILootCooldown = 20 * time.Second
+
+	SeenPOITTLSec     = 6 * time.Second  // сколько “держится в голове” факт, что видел
+	SeenToKnownCount  = 3                // сколько раз увидеть, чтобы стало KnowSeen
+	SeenToKnownWindow = 20 * time.Second // окно накопления
+
 )
 
 type Phase string
@@ -157,11 +158,11 @@ type Player struct {
 	Gold         int
 	LastPin      time.Time
 
-	KnownLocations  map[LocKey]LocKnowLevel
-	KnownPOI        map[string]POIKnow
-	LastPOILoot     map[string]time.Time
-	SeenPOI 	    map[string]time.Time
-	SeenPOICount 	map[string]int
+	KnownLocations map[LocKey]LocKnowLevel
+	KnownPOI       map[string]POIKnow
+	LastPOILoot    map[string]time.Time
+	SeenPOI        map[string]time.Time
+	SeenPOICount   map[string]int
 }
 
 type Gate struct {
@@ -208,13 +209,30 @@ type World struct {
 	Locations map[LocKey]*Location
 	Battles   map[int]*Battle
 
+	// MarketPOI is a simple information market (v1): players can list POI keys they know.
+	MarketPOI      map[int64]*POIListing
+	NextPOIListing int64
+
 	NextBattleID   int
 	NextEntranceID int
 	NextPocketID   int
 
 	LastForgetSweep time.Time
 
-	LogFile  *os.File
-	Rng      *rand.Rand
-	OnEvent  func(Event)
+	LogFile *os.File
+	Rng     *rand.Rand
+	OnEvent func(Event)
+}
+
+// POIListing represents a market offer to sell a single POI key multiple times.
+// MVP scope: we trade POI keys only (not items/resources yet).
+type POIListing struct {
+	ID       int64          `json:"id"`
+	SellerID int            `json:"sellerId"`
+	Key      string         `json:"key"`
+	Level    KnowledgeLevel `json:"level"`
+	Pinned   bool           `json:"pinned"`
+	Price    int            `json:"price"`
+	UsesLeft int            `json:"usesLeft"`
+	Created  time.Time      `json:"created"`
 }

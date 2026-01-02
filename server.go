@@ -14,10 +14,11 @@ import (
 type ctrlMsgKind string
 
 const (
-	ctrlPause ctrlMsgKind = "pause"
-	ctrlStep  ctrlMsgKind = "step"
-	ctrlSeed  ctrlMsgKind = "seed"
-	ctrlReset ctrlMsgKind = "reset"
+	ctrlPause            ctrlMsgKind = "pause"
+	ctrlStep             ctrlMsgKind = "step"
+	ctrlSeed             ctrlMsgKind = "seed"
+	ctrlReset            ctrlMsgKind = "reset"
+	ctrlDevSellPinnedPOI ctrlMsgKind = "dev_sell_pinned_poi"
 )
 
 type ctrlMsg struct {
@@ -26,6 +27,9 @@ type ctrlMsg struct {
 	n       int
 	seed    int64
 	players int
+	player  int
+	price   int
+	uses    int
 }
 
 type Server struct {
@@ -187,6 +191,32 @@ func (s *Server) applyCtrl(msg ctrlMsg) {
 		s.evMu.Lock()
 		s.events = s.events[:0]
 		s.evMu.Unlock()
+
+	case ctrlDevSellPinnedPOI:
+		s.worldMu.Lock()
+		defer s.worldMu.Unlock()
+
+		p := s.world.FindPlayer(msg.player)
+		if p == nil {
+			s.appendEvent(Event{T: time.Now(), K: "MARKET_POI_CREATE_FAIL", P1: msg.player, Msg: "player not found"})
+			return
+		}
+
+		key, ok := s.world.PickRandomPinnedPOIKey(p) // если ты уже добавил этот метод
+		if !ok {
+			s.appendEvent(Event{T: time.Now(), K: "MARKET_POI_CREATE_FAIL", P1: p.ID, Msg: "no pinned poi"})
+			return
+		}
+
+		now := time.Now()
+		listing, err := s.world.CreatePOIListing(p, key, msg.price, msg.uses, now)
+		if err != nil {
+			s.appendEvent(Event{T: now, K: "MARKET_POI_CREATE_FAIL", P1: p.ID, Msg: err.Error(), Ex: map[string]any{"key": key}})
+			return
+		}
+
+		s.appendEvent(Event{T: now, K: "MARKET_POI_CREATE", P1: p.ID, Msg: "poi listed", Ex: map[string]any{"id": listing.ID, "key": key, "price": msg.price, "uses": msg.uses}})
+
 	}
 }
 
@@ -375,4 +405,112 @@ func (s *Server) handleDebugWorld(w http.ResponseWriter, r *http.Request) {
 		"locations": locs,
 		// можешь добавить любые поля, не боясь UI
 	})
+}
+
+// ------------------- MARKET (POI v1) -------------------
+
+func (s *Server) handleMarketPOI(w http.ResponseWriter, r *http.Request) {
+	// GET /api/market/poi
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.worldMu.RLock()
+	list := s.world.ListPOIListings()
+	s.worldMu.RUnlock()
+	writeJSON(w, map[string]any{"ok": true, "list": list})
+}
+
+func (s *Server) handleMarketPOICreate(w http.ResponseWriter, r *http.Request) {
+	// POST /api/market/poi/create?seller=ID&key=...&price=...&uses=...
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sellerID, _ := strconv.Atoi(r.URL.Query().Get("seller"))
+	if sellerID <= 0 {
+		http.Error(w, "missing seller", 400)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		// allow legacy param name
+		key = r.URL.Query().Get("poi")
+	}
+	if key == "" {
+		http.Error(w, "missing key", 400)
+		return
+	}
+	price, _ := strconv.Atoi(r.URL.Query().Get("price"))
+	uses, _ := strconv.Atoi(r.URL.Query().Get("uses"))
+
+	s.worldMu.Lock()
+	defer s.worldMu.Unlock()
+	seller := s.world.FindPlayer(sellerID)
+	if seller == nil {
+		http.Error(w, "seller not found", 404)
+		return
+	}
+	listing, err := s.world.CreatePOIListing(seller, key, price, uses, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "listing": listing})
+}
+
+func (s *Server) handleMarketPOIBuy(w http.ResponseWriter, r *http.Request) {
+	// POST /api/market/poi/buy?id=LISTING_ID&buyer=PLAYER_ID
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "bad id", 400)
+		return
+	}
+	buyerID, _ := strconv.Atoi(r.URL.Query().Get("buyer"))
+	if buyerID <= 0 {
+		http.Error(w, "missing buyer", 400)
+		return
+	}
+
+	s.worldMu.Lock()
+	defer s.worldMu.Unlock()
+	buyer := s.world.FindPlayer(buyerID)
+	if buyer == nil {
+		http.Error(w, "buyer not found", 404)
+		return
+	}
+	listing, err := s.world.BuyPOIListing(buyer, id, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "listing": listing, "buyerGold": buyer.Gold})
+}
+
+func (s *Server) handleDevSellPinnedPOI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", 405)
+		return
+	}
+
+	pid, _ := strconv.Atoi(r.URL.Query().Get("player"))
+	price, _ := strconv.Atoi(r.URL.Query().Get("price"))
+	uses, _ := strconv.Atoi(r.URL.Query().Get("uses"))
+	if uses <= 0 {
+		uses = 10
+	}
+	if price < 0 {
+		price = 0
+	}
+	if pid <= 0 {
+		http.Error(w, "missing player", 400)
+		return
+	}
+
+	s.ctrlCh <- ctrlMsg{kind: ctrlDevSellPinnedPOI, player: pid, price: price, uses: uses}
+	writeJSON(w, map[string]any{"ok": true})
 }

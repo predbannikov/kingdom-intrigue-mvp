@@ -26,10 +26,10 @@ func seedWorld(w *World, playerCount int) {
 			Gold:           2 + w.Rng.Intn(10),
 			KnownLocations: map[LocKey]LocKnowLevel{},
 			KnownPOI:       map[string]POIKnow{},
-			LastPOILoot: map[string]time.Time{},
+			LastPOILoot:    map[string]time.Time{},
 			SpawnProtect:   now.Add(SpawnInvuln),
-			SeenPOI:      map[string]time.Time{},
-			SeenPOICount: map[string]int{},
+			SeenPOI:        map[string]time.Time{},
+			SeenPOICount:   map[string]int{},
 		}
 		loc.Players[p.ID] = p
 		p.KnownLocations[loc.Key] = LocKnowExperienced
@@ -46,6 +46,8 @@ func NewWorld() *World {
 	return &World{
 		Locations:      map[LocKey]*Location{},
 		Battles:        map[int]*Battle{},
+		MarketPOI:      map[int64]*POIListing{},
+		NextPOIListing: 1,
 		NextBattleID:   1,
 		NextEntranceID: 1,
 		NextPocketID:   1,
@@ -508,7 +510,6 @@ func (w *World) RespawnPlayer(p *Player, now time.Time) {
 	w.Log(Event{T: now, K: "RESPAWN", LX: to.Key.X, LY: to.Key.Y, LZ: to.Key.Z, P1: p.ID, X: p.X, Y: p.Y, Msg: "respawned", Ex: map[string]any{"invulnSec": int(SpawnInvuln.Seconds())}})
 }
 
-
 func (w *World) RebuildOcc(loc *Location) {
 	loc.Occ = map[[2]int][]int{}
 	for _, p := range loc.Players {
@@ -629,6 +630,108 @@ func (w *World) TryTradeMapInfo(loc *Location, a, b *Player, now time.Time) bool
 	w.AddPOIKnowledge(off.buyer, off.key, off.lvl, now, "bought map info", map[string]any{"from": off.seller.ID, "price": off.price})
 	w.Log(Event{T: now, K: "TRADE_DONE", LX: loc.Key.X, LY: loc.Key.Y, LZ: loc.Key.Z, P1: off.seller.ID, P2: off.buyer.ID, Msg: "trade complete", Ex: map[string]any{"key": off.key, "level": off.lvl.String(), "price": off.price}})
 	return true
+}
+
+// ------------------- MARKET (POI v1) -------------------
+
+// CreatePOIListing lists a POI key that the seller already knows.
+// Recommended: require that the POI is pinned (costs ink), so listings are valuable and limited.
+func (w *World) CreatePOIListing(seller *Player, key string, price int, uses int, now time.Time) (*POIListing, error) {
+	if seller == nil || !seller.Alive {
+		return nil, fmt.Errorf("seller not alive")
+	}
+	kn, ok := seller.KnownPOI[key]
+	if !ok {
+		return nil, fmt.Errorf("seller doesn't know POI")
+	}
+	if !kn.Pinned {
+		return nil, fmt.Errorf("POI must be pinned to sell")
+	}
+	if price <= 0 {
+		// sensible defaults by knowledge quality
+		price = MapBuyRumorPrice
+		switch kn.Level {
+		case KnowSeen:
+			price = MapBuySeenPrice
+		case KnowExperienced:
+			price = MapBuyExpPrice
+		}
+	}
+	if uses <= 0 {
+		uses = 10
+	}
+	id := w.NextPOIListing
+	w.NextPOIListing++
+	l := &POIListing{
+		ID:       id,
+		SellerID: seller.ID,
+		Key:      key,
+		Level:    kn.Level,
+		Pinned:   kn.Pinned,
+		Price:    price,
+		UsesLeft: uses,
+		Created:  now,
+	}
+	w.MarketPOI[id] = l
+	w.Log(Event{T: now, K: "MARKET_POI_CREATE", LX: seller.Loc.X, LY: seller.Loc.Y, LZ: seller.Loc.Z, P1: seller.ID, Msg: "poi listed", Ex: map[string]any{
+		"id": id, "key": key, "price": price, "uses": uses, "level": kn.Level.String(), "pinned": kn.Pinned,
+	}})
+	return l, nil
+}
+
+func (w *World) ListPOIListings() []*POIListing {
+	out := make([]*POIListing, 0, len(w.MarketPOI))
+	for _, l := range w.MarketPOI {
+		if l == nil || l.UsesLeft <= 0 {
+			continue
+		}
+		out = append(out, l)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// BuyPOIListing purchases a listing by id.
+// Buyer gains POI knowledge (at least the listing's knowledge level).
+func (w *World) BuyPOIListing(buyer *Player, listingID int64, now time.Time) (*POIListing, error) {
+	if buyer == nil || !buyer.Alive {
+		return nil, fmt.Errorf("buyer not alive")
+	}
+	l := w.MarketPOI[listingID]
+	if l == nil || l.UsesLeft <= 0 {
+		return nil, fmt.Errorf("listing not found")
+	}
+	if buyer.ID == l.SellerID {
+		return nil, fmt.Errorf("cannot buy your own listing")
+	}
+	if _, ok := buyer.KnownPOI[l.Key]; ok {
+		return nil, fmt.Errorf("buyer already knows this POI")
+	}
+	if buyer.Gold < l.Price {
+		return nil, fmt.Errorf("not enough gold")
+	}
+	seller := w.FindPlayer(l.SellerID)
+	if seller == nil {
+		return nil, fmt.Errorf("seller offline")
+	}
+
+	// money transfer
+	buyer.Gold -= l.Price
+	seller.Gold += l.Price
+
+	// knowledge transfer
+	w.AddPOIKnowledge(buyer, l.Key, l.Level, now, "bought poi from market", map[string]any{"from": seller.ID, "price": l.Price, "listingId": l.ID})
+
+	// consume listing
+	l.UsesLeft--
+	if l.UsesLeft <= 0 {
+		delete(w.MarketPOI, l.ID)
+	}
+
+	w.Log(Event{T: now, K: "MARKET_POI_BUY", LX: buyer.Loc.X, LY: buyer.Loc.Y, LZ: buyer.Loc.Z, P1: buyer.ID, P2: seller.ID, Msg: "poi purchased", Ex: map[string]any{
+		"id": l.ID, "key": l.Key, "price": l.Price, "level": l.Level.String(), "usesLeft": max(0, l.UsesLeft),
+	}})
+	return l, nil
 }
 
 func (w *World) StartBattle(locKey LocKey, x, y int, participants []int, now time.Time) *Battle {
@@ -854,8 +957,18 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
-func abs(x int) int { if x < 0 { return -x }; return x }
-func max(a, b int) int { if a > b { return a }; return b }
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func mergeMap(a, b map[string]any) map[string]any {
 	out := map[string]any{}
@@ -867,7 +980,6 @@ func mergeMap(a, b map[string]any) map[string]any {
 	}
 	return out
 }
-
 
 func (w *World) TryGrantPOILoot(p *Player, poi string, e *Entrance, now time.Time) {
 	if p.LastPOILoot == nil {
@@ -930,15 +1042,15 @@ func (w *World) TryGrantPOILoot(p *Player, poi string, e *Entrance, now time.Tim
 	w.Log(Event{
 		T: now, K: "POI_LOOT",
 		LX: p.Loc.X, LY: p.Loc.Y, LZ: p.Loc.Z,
-		P1: p.ID,
+		P1:  p.ID,
 		Msg: "poi loot granted",
 		Ex: map[string]any{
-			"poi": poi,
-			"kind": string(e.Kind),
-			"gold": gold,
-			"ink": ink,
-			"hpDelta": hpDelta,
-			"hp": p.HP,
+			"poi":         poi,
+			"kind":        string(e.Kind),
+			"gold":        gold,
+			"ink":         ink,
+			"hpDelta":     hpDelta,
+			"hp":          p.HP,
 			"cooldownSec": int(POILootCooldown.Seconds()),
 		},
 	})
@@ -966,7 +1078,7 @@ func (w *World) MarkPOISeen(p *Player, key string, now time.Time, extra map[stri
 	w.Log(Event{
 		T: now, K: "POI_SEEN",
 		LX: p.Loc.X, LY: p.Loc.Y, LZ: p.Loc.Z,
-		P1: p.ID,
+		P1:  p.ID,
 		Msg: "poi seen",
 		Ex: mergeMap(extra, map[string]any{
 			"key":   key,
@@ -987,4 +1099,20 @@ func (w *World) MarkPOISeen(p *Player, key string, now time.Time, extra map[stri
 			"seenCount": p.SeenPOICount[key],
 		})
 	}
+}
+
+func (w *World) PickRandomPinnedPOIKey(p *Player) (string, bool) {
+	if p.KnownPOI == nil || len(p.KnownPOI) == 0 {
+		return "", false
+	}
+	keys := make([]string, 0, len(p.KnownPOI))
+	for k, know := range p.KnownPOI {
+		if know.Pinned && know.Level >= KnowSeen { // или твой уровень
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return "", false
+	}
+	return keys[w.Rng.Intn(len(keys))], true
 }

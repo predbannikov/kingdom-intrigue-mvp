@@ -34,7 +34,7 @@
     .right pre{margin:0; white-space:pre-wrap; word-break:break-word; font-size:12px; color:var(--muted)}
     a{color:var(--accent); text-decoration:none}
     .btn.on{border:1px solid rgba(59,130,246,0.7); box-shadow:0 0 0 2px rgba(59,130,246,0.15) inset;}
-    
+
   </style>
 </head>
 <body>
@@ -58,6 +58,10 @@
 
     <input id="seedVal" class="mono" style="width:120px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--panel); color:var(--text);" placeholder="seed"/>
     <button class="btn" id="btnSeed">seed</button>
+
+    <button class="btn" id="btnSellPinned">sell pinned poi</button>
+    <input id="sellPrice" class="mono" style="width:60px" placeholder="price" value="3"/>
+    <input id="sellUses"  class="mono" style="width:60px" placeholder="uses" value="10"/>
   </span>
 
   <span class="tag">Z
@@ -98,8 +102,16 @@
   <div class="split right">
     <div class="card">
       <h2>Focused location</h2>
+            <canvas id="locMap" width="260" height="260" style="
+            width:260px;height:260px;
+            border:1px solid var(--border);
+            border-radius:12px;
+            background:rgba(0,0,0,0.25);
+            display:block;
+            margin-top:10px;"></canvas>
       <div class="row" id="locTags"></div>
       <pre id="locJson" class="mono"></pre>
+
     </div>
 
     <div class="card">
@@ -294,6 +306,8 @@ async function loadLoc(x,y,z){
   // focus first alive player (if any)
   const alive = (loc.players||[]).find(p=>p.alive);
   if (alive) renderPlayer(alive);
+  drawLocMiniMap(loc);
+
 }
 
 function renderPlayer(p){
@@ -306,6 +320,92 @@ function renderPlayer(p){
   $("plTags").innerHTML = tags.join("");
   $("plJson").textContent = JSON.stringify(p, null, 2);
 }
+
+function drawLocMiniMap(loc){
+  const c = $("locMap");
+  if (!c || !loc) return;
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+
+  // читаем размеры мира
+  const size = (typeof loc.size === "number" && loc.size > 0) ? loc.size : (window.LocSize || 100);
+
+  // фон
+  ctx.clearRect(0,0,W,H);
+
+  // сетка (очень лёгкая)
+  const step = W / size;
+  ctx.globalAlpha = 0.12;
+  ctx.beginPath();
+  for (let i=0;i<=size;i+=10){
+    const x = i*step;
+    ctx.moveTo(x,0); ctx.lineTo(x,H);
+    ctx.moveTo(0,x); ctx.lineTo(W,x);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1.0;
+
+  // helper: world->canvas
+  const px = (x)=> (x+0.5)*step;
+  const py = (y)=> (y+0.5)*step;
+
+  // POI / entrances
+  const entrances = loc.entrances || [];
+  ctx.font = `${Math.max(10, step*1.6)}px monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  for (const e of entrances){
+    const x = Number(e.x), y = Number(e.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    // символ по типу
+    let ch = "◇";
+    const k = String(e.kind || "").toUpperCase();
+    if (k.includes("CAVE")) ch = "C";
+    else if (k.includes("SINK")) ch = "S";
+    else if (k.includes("ENTR")) ch = "E";
+    else if (k.includes("HID")) ch = "H";
+    ctx.fillText(ch, px(x), py(y));
+  }
+
+  // players
+  const players = loc.players || [];
+  for (const p of players){
+    const x = Number(p.x), y = Number(p.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+
+    const inBattle = (p.inBattle|0) > 0;
+    const alive = !!p.alive;
+
+    ctx.beginPath();
+    ctx.arc(px(x), py(y), Math.max(2.2, step*0.35), 0, Math.PI*2);
+    ctx.fill();
+
+    if (!alive){
+      // крестик
+      ctx.beginPath();
+      const r = Math.max(3.2, step*0.5);
+      ctx.moveTo(px(x)-r, py(y)-r);
+      ctx.lineTo(px(x)+r, py(y)+r);
+      ctx.moveTo(px(x)-r, py(y)+r);
+      ctx.lineTo(px(x)+r, py(y)-r);
+      ctx.stroke();
+    } else if (inBattle){
+      // обводка “в бою”
+      ctx.beginPath();
+      ctx.arc(px(x), py(y), Math.max(3.8, step*0.55), 0, Math.PI*2);
+      ctx.stroke();
+    }
+  }
+}
+
+
+$("btnSellPinned")?.addEventListener("click", ()=>{
+  if (!focusedPlayerId) return;
+  const price = $("sellPrice")?.value?.trim() || "0";
+  const uses  = $("sellUses")?.value?.trim() || "10";
+  devPost(`/api/dev/market/sell_pinned_poi?player=${focusedPlayerId}&price=${encodeURIComponent(price)}&uses=${encodeURIComponent(uses)}`);
+});
 
 $("heat").addEventListener("click", (ev)=>{
   if (!lastWorld) return;

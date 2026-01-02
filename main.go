@@ -38,6 +38,12 @@ func main() {
 	mux.HandleFunc("/api/dev/seed", srv.handleDevSeed)
 	mux.HandleFunc("/api/dev/reset", srv.handleDevReset)
 
+	// Market (POI v1)
+	mux.HandleFunc("/api/market/poi", srv.handleMarketPOI)
+	mux.HandleFunc("/api/market/poi/create", srv.handleMarketPOICreate)
+	mux.HandleFunc("/api/market/poi/buy", srv.handleMarketPOIBuy)
+	mux.HandleFunc("/api/dev/market/sell_pinned_poi", srv.handleDevSellPinnedPOI)
+
 	mux.HandleFunc("/api/debug/world", srv.handleDebugWorld)
 
 	// Static UI
