@@ -3,11 +3,14 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"sort"
 	"time"
 )
+
+const deathGoldLossFrac = 0.30 // 30%
 
 func seedWorld(w *World, playerCount int) {
 	start := LocKey{X: StartWorldX, Y: StartWorldY, Z: 0}
@@ -90,6 +93,54 @@ func (w *World) TickAllLocations() {
 	}
 }
 
+func clamp01f(x float64) float64 {
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+func (w *World) riskAtCell(loc *Location, p *Player, nx, ny int) float64 {
+	r := 0.0
+
+	// 1) толпа в клетке (len slice)
+	if loc.Occ != nil {
+		cnt := len(loc.Occ[[2]int{nx, ny}])
+		if cnt >= 1 {
+			r += 0.15
+		}
+		if cnt >= 3 {
+			r += 0.25
+		}
+		if cnt >= 6 {
+			r += 0.35
+		}
+	}
+
+	// 2) "неизвестность" локации
+	lvl := p.KnownLocations[loc.Key]
+	if lvl < LocKnowSeen {
+		r += 0.20
+	} else if lvl < LocKnowExperienced {
+		r += 0.10
+	}
+
+	// 3) низкий HP
+	if p.HP > 0 && p.HP < BaseHP/3 {
+		r += 0.15
+	}
+
+	return clamp01f(r)
+}
+
+func expectedLossGold(p *Player, risk float64) float64 {
+	lossOnDeath := float64(p.Gold) * deathGoldLossFrac
+	return risk * lossOnDeath
+}
+
 func (w *World) TickLocation(key LocKey) {
 	loc := w.GetOrCreateLocation(key)
 	now := time.Now()
@@ -120,15 +171,53 @@ func (w *World) TickLocation(key LocKey) {
 		}
 		w.TrySeeEntrances(loc, p, now)
 
-		dx, dy := randStep(w.Rng)
-		if dx == 0 && dy == 0 {
+		type cand struct {
+			nx, ny int
+			score  float64
+		}
+		best := cand{nx: p.X, ny: p.Y, score: 1e18}
+
+		// 4 направления + можно оставаться на месте (опционально)
+		dirs := [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {0, 0}}
+		w.Rng.Shuffle(len(dirs), func(i, j int) {
+			dirs[i], dirs[j] = dirs[j], dirs[i]
+		})
+
+		for _, d := range dirs {
+			nx, ny := clamp(p.X+d[0], 0, LocSize-1), clamp(p.Y+d[1], 0, LocSize-1)
+			if !loc.Walkable[nx][ny] {
+				continue
+			}
+
+			risk := w.riskAtCell(loc, p, nx, ny)
+			score := expectedLossGold(p, risk)
+
+			// маленький штраф за "стоять на месте", чтобы не залипали навсегда
+			if nx == p.X && ny == p.Y {
+				score += 0.05
+			}
+
+			// чуть-чуть "живости": иногда выбираем не строго лучший
+			// (иначе все будут идти одинаково)
+			jitter := (float64(w.Rng.Intn(21)) - 10.0) * 0.01 // −0.10 … +0.10
+			score *= 1.0 + jitter
+
+			eps := 0.05 // допустимая разница (5%)
+			if score < best.score*(1.0-eps) {
+				best = cand{nx: nx, ny: ny, score: score}
+			} else if math.Abs(score-best.score) <= best.score*eps {
+				// почти равно — выбираем случайно
+				if w.Rng.Intn(2) == 0 {
+					best = cand{nx: nx, ny: ny, score: score}
+				}
+			}
+		}
+
+		// применяем шаг
+		if best.nx == p.X && best.ny == p.Y {
 			continue
 		}
-		nx, ny := clamp(p.X+dx, 0, LocSize-1), clamp(p.Y+dy, 0, LocSize-1)
-		if !loc.Walkable[nx][ny] {
-			continue
-		}
-		p.X, p.Y = nx, ny
+		p.X, p.Y = best.nx, best.ny
 
 		if e := w.EntranceAt(loc, p.X, p.Y); e != nil {
 			w.HandleEntranceTrigger(loc, p, e, now)

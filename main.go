@@ -9,8 +9,8 @@ import (
 
 func main() {
 	port := flag.Int("port", 8080, "http port")
-	players := flag.Int("players", 220, "players")
-	tickms := flag.Int("tickms", 150, "tick interval (ms)")
+	players := flag.Int("players", 500, "players")
+	tickms := flag.Int("tickms", 80, "tick interval (ms)")
 	flag.Parse()
 
 	w := NewWorld()
