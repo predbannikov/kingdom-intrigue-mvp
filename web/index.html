@@ -127,6 +127,8 @@ const $ = (id) => document.getElementById(id);
 
 let lastWorld = null;
 let focusedLoc = null;
+let lastLoc = null;
+let lastLocAt = 0;
 
 function clamp01(x){ return Math.max(0, Math.min(1, x)); }
 
@@ -276,7 +278,9 @@ function renderTop(world){
 
 async function loadWorld(){
   const z = $("z").value;
-  const res = await fetch(`/api/world?z=${encodeURIComponent(z)}`);
+  // const res = await fetch(`/api/world?z=${encodeURIComponent(z)}`);
+  const res = await fetch(`/api/world?z=${encodeURIComponent(z)}`, { cache: "no-store" });
+
   const world = await res.json();
   lastWorld = world;
   $("tick").textContent = world.tick;
@@ -319,6 +323,7 @@ function renderPlayer(p){
   tags.push(`<span class="tag">battle ${p.inBattle}</span>`);
   $("plTags").innerHTML = tags.join("");
   $("plJson").textContent = JSON.stringify(p, null, 2);
+  focusedPlayerId = p.id;
 }
 
 function drawLocMiniMap(loc){
@@ -399,8 +404,42 @@ function drawLocMiniMap(loc){
   }
 }
 
+async function refreshFocusedLoc(){
+  if (!focusedLoc) return;
+
+  const now = Date.now();
+  if (now - lastLocAt < 600) return; // совпадает с world polling
+  lastLocAt = now;
+
+  try{
+    const {x,y,z} = focusedLoc;
+    const res = await fetch(`/api/loc?x=${x}&y=${y}&z=${z}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const loc = await res.json();
+    lastLoc = loc;
+
+    // обновляем JSON (и позже тут же будем рисовать миникарту)
+    $("locJson").textContent = JSON.stringify(loc, null, 2);
+
+    // обновим теги (players count двигается)
+    const tags = [];
+    tags.push(`<span class="tag mono">loc ${x},${y},${z}</span>`);
+    tags.push(`<span class="tag">kind ${loc.kind}</span>`);
+    tags.push(`<span class="tag">players ${(loc.players||[]).length}</span>`);
+    tags.push(`<span class="tag">entrances ${(loc.entrances||[]).length}</span>`);
+    $("locTags").innerHTML = tags.join("");
+    drawLocMiniMap(loc);
+
+  }catch(e){
+    console.warn("refreshFocusedLoc failed", e);
+  }
+}
+
+
+
 
 $("btnSellPinned")?.addEventListener("click", ()=>{
+  let focusedPlayerId = 0;
   if (!focusedPlayerId) return;
   const price = $("sellPrice")?.value?.trim() || "0";
   const uses  = $("sellUses")?.value?.trim() || "10";
@@ -436,8 +475,19 @@ $("heat").addEventListener("click", (ev)=>{
 $("z").addEventListener("change", loadWorld);
 $("mode").addEventListener("change", ()=> drawHeatmap(lastWorld));
 
-setInterval(loadWorld, 600);
-loadWorld();
+// ctx.fillStyle = "rgba(255,255,255,0.35)";
+// ctx.font = "14px ui-monospace, monospace";
+// ctx.fillText(`tick ${world.tick}`, 12, 20);
+
+async function uiTick(){
+  await loadWorld();
+  await refreshFocusedLoc();
+}
+
+setInterval(uiTick, 600);
+uiTick();
+
+
 </script>
 </body>
 </html>
